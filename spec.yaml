@@ -1,0 +1,225 @@
+# syntax=docker/sandbox-kit:3
+#
+# Docker Sandboxes kit (schema v3) that adds Grafana Agent Observability
+# (agento11y) capture to a coding-agent workload. It is a `mixin`: it layers
+# onto a workload kit such as docker/sbx-kit-claude or docker/sbx-kit-codex.
+#
+# v3 kits are built with BuildKit (the `# syntax=` line above points at the
+# docker/sandbox-kit:3 frontend), NOT with `sbx kit` (that is the older v2
+# line and will reject this file). Build → push to a registry → run with sbx.
+# The Makefile wraps the whole flow; by hand it is:
+#
+#   docker buildx build . -f spec.yaml -t <registry>/<name>:<tag> --push
+#   sbx run <registry>/<name>:<tag> --kit-arg agento11y_endpoint=... \
+#       --kit-arg agento11y_tenant_id=...   # onto a workload; see README
+#
+# Validate locally without pushing:
+#   docker buildx build --output type=cacheonly -f spec.yaml .
+
+schemaVersion: "3"
+kind: mixin
+
+displayName: Agent Observability (mixin)
+description: Adds Grafana Agent Observability capture to any coding agent
+author: Pete Wall
+sourceUrl: https://github.com/petewall/agento11y-kit
+licenses: [Apache-2.0]
+version: "0.1.0"   # this kit's own release version (required for publish)
+
+# agento11y is fetched at startup (see the install hook), not baked into this
+# artifact, so `provides` names the tool without pinning a version — a
+# published descriptor can't reference the create-phase `version` arg.
+provides: ["agento11y"]
+
+# ---------------------------------------------------------------------------
+# Args — these actually interpolate in v3 (verified the syntax against the gh
+# example in SPEC-v3). Each `env:` arg is exported into the container as that
+# variable; args are also referenced directly in commands via
+# ${{ kit.args.<name> }}.
+# ---------------------------------------------------------------------------
+args:
+  # All args are namespaced with an `agento11y_` prefix so a global
+  # `--kit-arg agento11y_endpoint=...` can't collide with an arg the base
+  # workload happens to declare. NOTE: v3 arg names can't contain hyphens
+  # (the frontend rejects them), so this is snake_case, not `agento11y-*`.
+
+  # User-facing: what the v2 kit told you to pass with -e now has a home.
+  agento11y_endpoint:
+    required: true
+    env: AGENTO11Y_ENDPOINT
+    description: Conversations API URL, e.g. https://agento11y-prod-us-east-0.grafana.net
+  agento11y_otlp_endpoint:
+    required: false
+    env: AGENTO11Y_OTEL_EXPORTER_OTLP_ENDPOINT
+    description: OpenTelemetry API URL, e.g. https://otlp-gateway-prod-us-east-2.grafana.net/otlp
+  agento11y_tenant_id:
+    required: true
+    env: AGENTO11Y_AUTH_TENANT_ID
+    description: Grafana Cloud stack/instance id
+  agento11y_blank:
+    default: ""
+    description: >-
+      Always empty — do not set. Exists only so the credential `username` below
+      is a MULTI-reference string (embedded → text interpolation) instead of a
+      lone reference, which sbx would otherwise type as a JSON number for a
+      numeric tenant id. (sbx has no `string`/`quote` filter — an unknown filter
+      silently leaves the whole ${{ }} literal, which is the 401 we chased.)
+  agento11y_version:
+    default: latest
+    pattern: '^(latest|v?[0-9]+\.[0-9]+\.[0-9]+)$'
+    description: agento11y release to install; "latest" resolves at create time
+
+  # Effectively constants — agento11y client settings that rarely change.
+  # v3 mixins express container env through args (there is no top-level
+  # `environment:` block like v2 had), so these ride as defaulted args. Leave
+  # them alone unless you know why.
+  agento11y_protocol:
+    default: http
+    env: AGENTO11Y_PROTOCOL
+    description: Transport protocol for the agento11y client
+  agento11y_auth_mode:
+    default: basic
+    env: AGENTO11Y_AUTH_MODE
+    description: Auth mode; pairs with the scheme:basic credential below
+  agento11y_content_capture_mode:
+    default: full
+    env: AGENTO11Y_CONTENT_CAPTURE_MODE
+    description: >-
+      Data forwarding scope. `full` sends complete prompt+tool content
+      (including any secrets that surface in a transcript). Tighten to
+      no_tool_content / metadata_only for stricter environments.
+  agento11y_tags:
+    default: "sandbox=sbx"
+    env: AGENTO11Y_TAGS
+    description: Low-cardinality client tags (CSV key=value) on generation exports
+
+capabilities:
+  # -------------------------------------------------------------------------
+  # Lifecycle: install agento11y as the agent user, then register its capture
+  # hook into each supported agent's OWN config. Hooks with a string `command`
+  # run via `sh -c`.
+  #
+  # Why not PATH shims / binary-wrapping (the v2 approach)? Both fail in a v3
+  # mixin, learned the hard way:
+  #   - staging shims under /opt fails — lifecycle files/commands run as the
+  #     non-root `agent` user, which can't write root-owned /opt
+  #     (`mkdir: Permission denied` at container start); and
+  #   - even relocated, a v3 mixin can only APPEND to PATH, so a shim dir can't
+  #     shadow the base workload's real `claude`.
+  # agento11y's per-agent `install` subcommand sidesteps both: it writes a hook
+  # into the agent's own settings (e.g. ~/.claude) — no /opt, no PATH games.
+  # It exists for claude/opencode/cursor. codex is wrapper-only (no install
+  # hook) and is handled by a separate root binary-wrap hook below.
+  #
+  # Everything runs as `user: agent` so agento11y lands on the agent's PATH
+  # (~/.local/bin) and the hook is written into the agent's real HOME.
+  - type: com.docker.sandbox/lifecycle@1
+    config:
+      install:
+        - description: Installing agento11y (agent user → ~/.local/bin)
+          user: agent
+          # Version interpolates at create time. install.sh treats an EMPTY
+          # VERSION as "latest", so map the literal "latest" back to empty.
+          command: >-
+            V='${{ kit.args.agento11y_version }}'; [ "$V" = latest ] && V='';
+            curl -fsSL https://raw.githubusercontent.com/grafana/agento11y/main/plugins/agento11y/scripts/install.sh
+            | VERSION="$V" sh
+        - description: Registering the agento11y capture hook for supported agents
+          user: agent
+          command: |
+            export PATH="$HOME/.local/bin:$PATH"
+            # Hook-based agents: `agento11y <agent> install` writes a persistent
+            # hook into the agent's own config. codex is handled separately
+            # below (it is wrapper-only, with no install subcommand).
+            for a in claude opencode cursor; do
+              command -v "$a" >/dev/null 2>&1 || continue
+              agento11y "$a" install || echo "agento11y $a install failed (non-fatal)"
+            done
+        - description: Wrapping the codex binary (wrapper-only agent) so it launches through agento11y
+          user: "0"
+          # codex has no install hook — the only way to capture it is to LAUNCH
+          # it as `agento11y codex -- ...`. A v3 mixin can't shadow it via PATH
+          # (append-only) or change the workload entrypoint, so we replace the
+          # real binary in place with a guarded wrapper. Runs as root so it can
+          # rewrite a root-owned binary; no-op in sandboxes without codex.
+          command: |
+            set -e
+            REAL=""
+            for cand in "$(command -v codex 2>/dev/null)" \
+                        /home/agent/.local/bin/codex /usr/local/bin/codex /usr/bin/codex; do
+              [ -n "$cand" ] && [ -x "$cand" ] && { REAL="$cand"; break; }
+            done
+            [ -n "$REAL" ] || exit 0                     # no codex here → nothing to do
+            case "$REAL" in *.agento11y-real) exit 0 ;; esac
+            [ -e "$REAL.agento11y-real" ] && exit 0       # already wrapped (idempotent)
+            mv "$REAL" "$REAL.agento11y-real"
+            # Write a static wrapper via printf (indentation-safe). The guard
+            # env var breaks the re-entry loop when agento11y launches the real
+            # codex; agento11y is resolved from the agent's ~/.local/bin.
+            printf '%s\n' \
+              '#!/bin/sh' \
+              '# agento11y codex wrapper (codex is wrapper-only — intercept at the binary)' \
+              'export PATH="/home/agent/.local/bin:$HOME/.local/bin:$PATH"' \
+              'if [ -n "$AGENTO11Y_CODEX_WRAP" ]; then' \
+              "  exec \"$REAL.agento11y-real\" \"\$@\"" \
+              'fi' \
+              'export AGENTO11Y_CODEX_WRAP=1' \
+              'exec agento11y codex -- "$@"' \
+              > "$REAL"
+            chmod +x "$REAL"
+
+  # -------------------------------------------------------------------------
+  # Network — split by phase. Install needs GitHub (script + API + the release
+  # asset CDN that v2 forgot). Runtime only needs Grafana Cloud, so the running
+  # agent can't reach GitHub at all.
+  # -------------------------------------------------------------------------
+  - type: com.docker.sandbox/network-policy@1
+    config:
+      install:
+        allow:
+          - raw.githubusercontent.com          # install.sh
+          - api.github.com                      # latest-release lookup
+          - github.com                          # release download redirect
+          - release-assets.githubusercontent.com # actual archive (v2 BUG: missing)
+          - objects.githubusercontent.com        # older asset-CDN host
+      runtime:
+        allow:
+          - "agento11y-*.grafana.net"
+          - "otlp-gateway-*.grafana.net"
+
+  # -------------------------------------------------------------------------
+  # Credential — RAW token as the secret; the proxy builds
+  #   Authorization: Basic base64("<tenant>:<token>")
+  # via scheme:basic + a templated username. Store the raw glc_ token (NOT a
+  # base64 blob — scheme:basic uses the secret as the password):
+  #
+  #   printf '%s' "<glc_token>" | sbx secret set agento11y-token
+  #
+  # The username is an EMBEDDED (two-reference) string, deliberately NOT a lone
+  # "${{ kit.args.agento11y_tenant_id }}":
+  #   - a lone whole-value ref types a numeric tenant as a JSON number → fails
+  #     the string username field; and
+  #   - sbx has no string/quote filter to coerce it (an unknown filter silently
+  #     leaves the ${{ }} literal → the Basic username became the raw template
+  #     string → HTTP 401; proven by intercepting the injected header).
+  # Concatenating the empty `agento11y_blank` arg makes it a multi-reference
+  # string, which v3 interpolates as TEXT → a clean "659063". VERIFIED end to
+  # end: the injected header decodes to `659063:<secret>`, and the same creds
+  # return 202 (conversations) / non-401 (OTLP) host-side.
+  # -------------------------------------------------------------------------
+  - type: com.docker.sandbox/credential@1
+    description: Grafana Cloud token for agento11y export (conversations + OTLP)
+    config:
+      service: agento11y-token
+      phase: runtime
+      apiKey:
+        name: AGENTO11Y_AUTH_TOKEN
+        proxyManaged: true
+        inject:
+          - domain: "agento11y-*.grafana.net"
+            scheme: basic
+            username: "${{ kit.args.agento11y_tenant_id }}${{ kit.args.agento11y_blank }}"
+          - domain: "otlp-gateway-*.grafana.net"
+            scheme: basic
+            username: "${{ kit.args.agento11y_tenant_id }}${{ kit.args.agento11y_blank }}"
+
