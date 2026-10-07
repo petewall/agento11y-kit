@@ -6,17 +6,32 @@
   <img src="assets/grafana.svg" alt="Grafana" height="44">
 </p>
 
-A [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) (`sbx`) **mixin kit**
-(schema v3) that adds [Grafana Agent Observability](https://github.com/grafana/agento11y)
-(agento11y) capture to a coding-agent sandbox. It installs the `agento11y`
-binary at container startup, wires the agent so its sessions are exported, and
-injects the Grafana Cloud credential **at the proxy** — so the raw token never
-has to live in the container environment.
+![Screenshot of the agento11y sandbox kit](assets/screenshot.jpg)
 
-It's a `mixin`, so it layers onto a **workload** kit (e.g.
-`docker/sbx-kit-claude`, `docker/sbx-kit-codex`).
+This kit lets you capture coding-agent activity from an isolated Docker
+Sandbox and send it to [Grafana Agent Observability
+(agento11y)](https://github.com/grafana/agento11y). It installs the `agento11y`
+tool when the sandbox starts and configures supported agents to send their
+sessions to Grafana Cloud.
+
+The kit is a **mixin**: an add-on that works alongside a **workload kit**, which
+provides the coding agent itself (for example, Claude Code or Codex). The
+credential is added by the sandbox's network proxy, so the raw Grafana token
+does not need to be stored inside the container.
+
+## Quick start
+
+1. Install the Docker Sandboxes command-line tool (`sbx`) and Docker with
+   `buildx` enabled.
+2. Save your Grafana Cloud token as an `sbx` secret (step 1 below).
+3. Build and publish this kit (step 2).
+4. Set your Grafana Cloud endpoint and stack ID, then start a sandbox (step 3).
+
+The sections below explain each step and the settings you can change.
 
 ## Agent support
+
+The kit currently captures activity from these agents:
 
 | Agent | Captured | Mechanism |
 |---|---|---|
@@ -27,25 +42,29 @@ It's a `mixin`, so it layers onto a **workload** kit (e.g.
 
 ## Prerequisites
 
-- **`sbx`** (Docker Sandboxes CLI) — `sbx version`.
-- **Docker with `buildx`** — v3 kits are built by the `docker/sandbox-kit:3`
-  BuildKit frontend.
-- **A container registry** you can push to (e.g. `ghcr.io/<you>`).
-- **A Grafana Cloud agento11y token.** For conversations it needs the
-  `sigil:write` scope; for the OTLP/analytics pipeline also `metrics:write` +
-  `traces:write`. You'll also need the stack/instance id and the endpoints.
+- **Docker Sandboxes (`sbx`)**, Docker's command-line tool for running isolated
+  development environments. Check that it is installed with `sbx version`.
+- **Docker with `buildx`**, used to build the kit image.
+- **A container registry** where you can publish the kit image, such as
+  `ghcr.io/<you>`.
+- **A Grafana Cloud agento11y token**, plus your stack (instance) ID and
+  endpoints. The token needs the `sigil:write` permission to send conversations.
+  To also send metrics and traces through OTLP, it needs `metrics:write` and
+  `traces:write` permissions.
 
 ## 1. Store the token
 
-`scheme: basic` uses the secret as the HTTP Basic **password**, so store the
-**raw** `glc_…` token (not a base64 blob) under the service `agento11y-token`:
+The proxy uses HTTP Basic authentication, which has a username and password.
+Store the **raw** `glc_…` token (not a base64-encoded value) as an `sbx` secret
+named `agento11y-token`:
 
 ```sh
 printf '%s' "<glc_token>" | sbx secret set agento11y-token
 ```
 
-The proxy builds `Authorization: Basic base64("<tenant>:<token>")` and injects
-it for the Grafana hosts; the token is never passed to the agent as a value.
+When a request goes to Grafana, the proxy combines your tenant ID and token into
+the required authorization header. The token is not passed to the agent as an
+environment variable or kit argument.
 
 ## 2. Build & push the kit
 
@@ -55,8 +74,8 @@ make push                               # → ghcr.io/petewall/sbx-agento11y-kit
 make push IMAGE=ghcr.io/<you>/sbx-agento11y-kit:0.1.0
 ```
 
-If the pushed package is **private**, give the sbx daemon a pull credential
-(it pulls kit images with its own creds, anonymously by default):
+If the published image is **private**, give the `sbx` service permission to
+download it. By default, it tries to download images without logging in:
 
 ```sh
 gh auth token | sbx secret set --registry ghcr.io --username <you> --password-stdin
@@ -64,8 +83,9 @@ gh auth token | sbx secret set --registry ghcr.io --username <you> --password-st
 
 ## 3. Run
 
-Export the instance-specific values (or use [direnv](https://direnv.net/) +
-`.envrc`), then launch:
+Set the values for your Grafana Cloud instance, then start the workload you use.
+You can export these variables in your shell or load them with
+[direnv](https://direnv.net/) from an `.envrc` file:
 
 ```sh
 export AGENTO11Y_ENDPOINT=https://agento11y-prod-us-east-0.grafana.net
@@ -76,10 +96,11 @@ make run-claude     # claude workload + agento11y mixin
 make run-codex      # codex workload  + agento11y mixin
 ```
 
-Inside the sandbox, confirm with `agento11y doctor` (expect `✓ Conversations`,
-and `✓ Analytics` if the OTLP endpoint + scopes are set).
+Inside the sandbox, run `agento11y doctor` to check the setup. You should see
+`✓ Conversations`. You will also see `✓ Analytics` if you set the OTLP endpoint
+and your token has the required permissions.
 
-The equivalent raw command (what the Makefile runs):
+For reference, this is the underlying `sbx run` command used by the Makefile:
 
 ```sh
 sbx run docker/sbx-kit-claude:2.1.278 . \
@@ -90,9 +111,9 @@ sbx run docker/sbx-kit-claude:2.1.278 . \
 
 ## Configuration
 
-All args are namespaced `agento11y_*` so a global `--kit-arg` can't collide
-with the base workload's args. (v3 arg names can't contain hyphens, hence
-snake_case.)
+The kit settings below are passed with `--kit-arg`. Each setting starts with
+`agento11y_` so it does not conflict with settings from the workload kit.
+Setting names use underscores because this kit format does not allow hyphens.
 
 | Arg (`--kit-arg`) | Env exported | Default | Purpose |
 |---|---|---|---|
@@ -105,12 +126,13 @@ snake_case.)
 | `agento11y_content_capture_mode` | `AGENTO11Y_CONTENT_CAPTURE_MODE` | `full` | Capture scope |
 | `agento11y_tags` | `AGENTO11Y_TAGS` | `sandbox=sbx` | Low-cardinality client tags |
 
-The `agento11y-token` secret supplies the credential; it is injected at the
-proxy, never passed as a kit-arg.
+The `agento11y-token` secret supplies the credential. The proxy adds it to
+Grafana requests; do not pass the token as a kit argument.
 
-> `agento11y_content_capture_mode=full` forwards complete prompt + tool content
-> to Grafana, including anything sensitive that surfaces in a transcript. Use
-> `no_tool_content` / `metadata_only` for stricter environments.
+> **Privacy:** `agento11y_content_capture_mode=full` sends complete prompts and
+> tool activity to Grafana. This may include sensitive information that appears
+> in a conversation. Choose `no_tool_content` or `metadata_only` to send less
+> content.
 
 ## Development
 
@@ -123,16 +145,20 @@ make help         # list targets
 
 ## Notes & caveats
 
-- **Workload base tags are pinned** (`CLAUDE_BASE`, `CODEX_BASE` in the
-  Makefile) to the newest tags the local `sbx` can decode — newer workload
-  tags can carry capabilities the installed CLI doesn't understand yet and fail
-  with `field name not found in type spec.plain`. Re-check with
-  `sbx kit inspect docker/sbx-kit-<agent>:latest` after upgrading `sbx`.
-- **Codex self-update** overwrites the wrapped binary, so capture is lost until
-  the sandbox is recreated (codex still runs — just unobserved).
-- **OTLP** uses the same tenant id as conversations here; if Grafana Cloud
-  assigns your OTLP endpoint a different instance id, analytics will 401 even
-  when conversations succeed.
+- **Workload kit versions:** The Makefile pins the Claude and Codex workload
+  versions (`CLAUDE_BASE` and `CODEX_BASE`) to versions supported by the local
+  `sbx` command. A newer workload may use settings that an older `sbx` cannot
+  read, causing an error such as `field name not found in type spec.plain`.
+  After upgrading `sbx`, check available kit details with
+  `sbx kit inspect docker/sbx-kit-<agent>:latest`.
+- **Codex self-update:** If Codex updates itself while the sandbox is running,
+  it replaces the wrapper that sends activity to agento11y. Codex will continue
+  to run, but its activity will no longer be captured until you recreate the
+  sandbox.
+- **OTLP instance ID:** This setup uses the same tenant ID for conversations
+  and OTLP. If your Grafana Cloud OTLP endpoint expects a different instance ID,
+  analytics requests will fail with an authorization error even if conversation
+  capture works.
 
 ## License
 
