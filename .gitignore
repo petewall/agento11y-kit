@@ -2,8 +2,5 @@
 dist/
 *.oci
 
-# Local, machine-specific env — 1Password references, not meant to be shared
-.envrc
-
 # Conductor workspace scratch
 .context/

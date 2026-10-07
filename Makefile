@@ -25,7 +25,7 @@ CLAUDE_SANDBOX ?= agento11y-claude
 CODEX_SANDBOX  ?= agento11y-codex
 
 .DEFAULT_GOAL := help
-.PHONY: help validate build push run-claude run-codex clean
+.PHONY: help validate build push set-token run-claude run-codex clean
 
 help: ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -44,6 +44,10 @@ PLATFORMS ?= linux/amd64,linux/arm64
 push: $(SPEC) ## Build multi-platform with attestations and push to $(IMAGE)
 	docker buildx build --push -t $(IMAGE) -f $< --provenance=true --sbom=true --platform=$(PLATFORMS) .
 	@echo "pushed $(IMAGE)"
+
+set-token: ## Store AGENTO11Y_ACCESS_TOKEN as the agento11y-token sbx secret
+	@test -n "$$AGENTO11Y_ACCESS_TOKEN" || { echo "AGENTO11Y_ACCESS_TOKEN must be set" >&2; exit 1; }
+	@printf '%s' "$$AGENTO11Y_ACCESS_TOKEN" | sbx secret set agento11y-token
 
 run-claude: ## Run the mixin on the v3 claude workload
 	sbx run --name $(CLAUDE_SANDBOX) $(CLAUDE_BASE) . $(KIT_ARGS)
